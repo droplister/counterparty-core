@@ -120,9 +120,9 @@ def parse(db, tx):
                     must_give = get_must_give(
                         db, dispenser, next_out["btc_amount"], next_out["block_index"]
                     )
-                except (exceptions.NoPriceError, ZeroDivisionError) as e:
+                except exceptions.NoPriceError as e:
                     logger.warning(
-                        "Cannot compute oracle dispense for %s; skipping: %s",
+                        "No oracle price for dispenser %s; skipping dispense: %s",
                         dispenser["asset"],
                         e,
                     )
@@ -131,12 +131,7 @@ def parse(db, tx):
                 actually_given = min(must_give, remaining) * give_quantity
                 give_remaining = dispenser["give_remaining"] - actually_given
 
-                if give_remaining < 0:
-                    logger.error(
-                        "Dispenser arithmetic underflow for %s; skipping dispense",
-                        dispenser["asset"],
-                    )
-                    continue
+                assert give_remaining >= 0
 
                 # Skip dispense if quantity is 0
                 if protocol.enabled("zero_quantity_value_adjustment_1") and actually_given == 0:
