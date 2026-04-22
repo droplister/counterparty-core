@@ -201,3 +201,9 @@ def test_parse_detach(ledger_db, blockchain_mock, defaults, test_helpers, curren
             },
         ],
     )
+
+
+def test_parse_invalid_utf8_does_not_halt(ledger_db, blockchain_mock, defaults):
+    tx = blockchain_mock.dummy_tx(ledger_db, defaults["addresses"][0])
+    message = b"\x80\x80\x80\x80"
+    utxo.parse(ledger_db, tx, message)
