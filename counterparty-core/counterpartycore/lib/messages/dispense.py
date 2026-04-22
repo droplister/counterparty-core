@@ -116,14 +116,27 @@ def parse(db, tx):
             give_quantity = dispenser["give_quantity"]
 
             if satoshirate > 0 and give_quantity > 0:
-                must_give = get_must_give(
-                    db, dispenser, next_out["btc_amount"], next_out["block_index"]
-                )
+                try:
+                    must_give = get_must_give(
+                        db, dispenser, next_out["btc_amount"], next_out["block_index"]
+                    )
+                except exceptions.NoPriceError as e:
+                    logger.warning(
+                        "No oracle price for dispenser %s; skipping dispense: %s",
+                        dispenser["asset"],
+                        e,
+                    )
+                    continue
                 remaining = int(floor(dispenser["give_remaining"] / give_quantity))
                 actually_given = min(must_give, remaining) * give_quantity
                 give_remaining = dispenser["give_remaining"] - actually_given
 
-                assert give_remaining >= 0
+                if give_remaining < 0:
+                    logger.error(
+                        "Dispenser arithmetic underflow for %s; skipping dispense",
+                        dispenser["asset"],
+                    )
+                    continue
 
                 # Skip dispense if quantity is 0
                 if protocol.enabled("zero_quantity_value_adjustment_1") and actually_given == 0:
