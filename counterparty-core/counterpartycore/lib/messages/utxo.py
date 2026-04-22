@@ -163,6 +163,7 @@ def parse(db, tx, message):
             "tx_hash": tx["tx_hash"],
             "msg_index": ledger.other.get_send_msg_index(db, tx["tx_hash"]),
             "block_index": tx["block_index"],
+            "source": tx["source"],
             "status": "invalid: could not unpack",
         }
         ledger.events.insert_record(db, "sends", bindings, "ATTACH_TO_UTXO")
