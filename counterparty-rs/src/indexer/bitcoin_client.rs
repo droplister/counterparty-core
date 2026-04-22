@@ -751,18 +751,28 @@ pub fn parse_transaction(
     if !data.is_empty() || 
         parsed_vouts.as_ref().map_or(false, |p| p.destinations == vec![config.unspendable()]) {
 
-        if BATCH_CLIENT.lock().unwrap().is_none() {
-            *BATCH_CLIENT.lock().unwrap() = Some(
-                BatchRpcClient::new(
-                    config.rpc_address.clone(),
-                    config.rpc_user.clone(),
-                    config.rpc_password.clone(),
-                )
-                .unwrap(),
-            );
+        // Recover from a poisoned mutex (PoisonError carries the inner data).
+        // Without this, any panic-while-holding by a prior worker would crash
+        // every subsequent worker on .unwrap(). HttpClient::builder().build()
+        // can also fail on a malformed rpc_address; log and skip the prev_tx
+        // lookup rather than crashing the worker on a config-validation issue.
+        let mut guard = BATCH_CLIENT
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            match BatchRpcClient::new(
+                config.rpc_address.clone(),
+                config.rpc_user.clone(),
+                config.rpc_password.clone(),
+            ) {
+                Ok(client) => *guard = Some(client),
+                Err(e) => {
+                    tracing::warn!("BatchRpcClient init failed; skipping prev_tx lookup: {:?}", e);
+                }
+            }
         }
 
-        if let Some(batch_client) = BATCH_CLIENT.lock().unwrap().as_ref() {
+        if let Some(batch_client) = guard.as_ref() {
 
             let input_txids: Vec<_> = tx
                 .input
