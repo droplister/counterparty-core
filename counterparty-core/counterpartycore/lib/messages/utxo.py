@@ -166,7 +166,7 @@ def parse(db, tx, message):
             "source": tx["source"],
             "status": "invalid: could not unpack",
         }
-        ledger.events.insert_record(db, "sends", bindings, "ATTACH_TO_UTXO")
+        ledger.events.insert_record(db, "sends", bindings, "INVALID_UTXO_MOVE")
         ledger.blocks.set_transaction_status(db, tx["tx_index"], False)
         return
 
