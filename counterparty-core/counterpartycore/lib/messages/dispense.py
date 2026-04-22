@@ -120,9 +120,9 @@ def parse(db, tx):
                     must_give = get_must_give(
                         db, dispenser, next_out["btc_amount"], next_out["block_index"]
                     )
-                except exceptions.NoPriceError as e:
+                except (exceptions.NoPriceError, ZeroDivisionError) as e:
                     logger.warning(
-                        "No oracle price for dispenser %s; skipping dispense: %s",
+                        "Cannot compute oracle dispense for %s; skipping: %s",
                         dispenser["asset"],
                         e,
                     )
