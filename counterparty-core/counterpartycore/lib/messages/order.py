@@ -95,7 +95,13 @@ def cancel_order_match(db, order_match, status, block_index, tx_index):
 
     # If tx0 is dead, credit address directly; if not, replenish give remaining, get remaining, and fee required remaining.
     orders = ledger.markets.get_order(db, order_hash=order_match["tx0_hash"])
-    assert len(orders) == 1
+    if len(orders) != 1:
+        logger.error(
+            "Expected exactly 1 order for tx0_hash %s, got %d; skipping cancel_order_match",
+            order_match["tx0_hash"],
+            len(orders),
+        )
+        return
     tx0_order = orders[0]
     if tx0_order["status"] in ("expired", "cancelled"):
         tx0_order_status = tx0_order["status"]
@@ -138,7 +144,13 @@ def cancel_order_match(db, order_match, status, block_index, tx_index):
 
     # If tx1 is dead, credit address directly; if not, replenish give remaining, get remaining, and fee required remaining.
     orders = ledger.markets.get_order(db, order_hash=order_match["tx1_hash"])
-    assert len(orders) == 1
+    if len(orders) != 1:
+        logger.error(
+            "Expected exactly 1 order for tx1_hash %s, got %d; skipping cancel_order_match",
+            order_match["tx1_hash"],
+            len(orders),
+        )
+        return
     tx1_order = orders[0]
     if tx1_order["status"] in ("expired", "cancelled"):
         tx1_order_status = tx1_order["status"]
@@ -486,7 +498,14 @@ def match(db, tx, block_index=None):
         cursor.close()
         return
 
-    assert len(orders) == 1
+    if len(orders) != 1:
+        logger.error(
+            "Expected exactly 1 order for tx_hash %s, got %d; skipping match",
+            tx["tx_hash"],
+            len(orders),
+        )
+        cursor.close()
+        return
     if orders[0]["status"] != "open":
         cursor.close()
         return

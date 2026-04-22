@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 from counterpartycore.lib import exceptions
 from counterpartycore.lib.messages import order
@@ -1093,3 +1095,33 @@ def test_parse_more_than_maxi(ledger_db, blockchain_mock, defaults, caplog, test
 
     with test_helpers.capture_log(caplog, "invalid: integer overflow"):
         order.parse(ledger_db, tx, message)
+
+
+def test_match_duplicate_order_does_not_halt(ledger_db):
+    fake_order = {"tx_index": 1, "tx_hash": "deadbeef", "status": "open"}
+    with patch("counterpartycore.lib.ledger.markets.get_order") as mock_get:
+        mock_get.return_value = [fake_order, fake_order]
+        assert order.match(ledger_db, {"tx_index": 1, "tx_hash": "deadbeef"}) is None
+
+
+def test_cancel_order_match_zero_orders_does_not_halt(ledger_db):
+    fake_match = {
+        "id": "deadbeef_cafebabe",
+        "tx0_hash": "deadbeef",
+        "tx1_hash": "cafebabe",
+        "tx0_address": "x",
+        "tx1_address": "y",
+        "forward_asset": "XCP",
+        "backward_asset": "BTC",
+        "forward_quantity": 0,
+        "backward_quantity": 0,
+        "fee_paid": 0,
+        "status": "pending",
+    }
+    with patch("counterpartycore.lib.ledger.markets.get_order") as mock_get_order, patch(
+        "counterpartycore.lib.ledger.markets.update_order_match_status"
+    ):
+        mock_get_order.return_value = []
+        assert (
+            order.cancel_order_match(ledger_db, fake_match, "expired", 99999, 99999) is None
+        )

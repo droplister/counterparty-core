@@ -395,7 +395,13 @@ def match(db, tx):
     if not bets:
         return
 
-    assert len(bets) == 1
+    if len(bets) != 1:
+        logger.error(
+            "Expected exactly 1 bet for tx_hash %s, got %d; skipping match",
+            tx["tx_hash"],
+            len(bets),
+        )
+        return
     if bets[0]["status"] != "open":
         return
 
