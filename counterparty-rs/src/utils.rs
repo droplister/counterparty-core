@@ -70,19 +70,14 @@ pub fn script_to_address_legacy(script_pubkey: Vec<u8>, network: &str) -> PyResu
         Ok(address.to_string())
     } else {
         /*
-         * the code below is correct, but not sure about the invocation path
-         * and untested bug compatibility
+         * Non-witness path: not currently reached by any Python caller (gettxinfo
+         * only invokes script_to_address_legacy with segwit scripts, which take
+         * the if-branch above), but if a future caller invokes with a non-witness
+         * script we would rather raise a Python exception than panic the process.
          */
-        let _address = match Address::from_script(&script, network_enum) {
-            Ok(addr) => addr,
-            Err(_) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "Failed to derive address",
-                ))
-            }
-        };
-        panic!("we thought this shouldn't happen!");
-        //Ok(address.to_string())
+        Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "script_to_address_legacy received a non-witness script",
+        ))
     }
 }
 
