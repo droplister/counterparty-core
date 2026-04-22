@@ -51,7 +51,7 @@ How I'd approach this codebase if I had no prior context. Order matters: top-dow
 | 8 | Protocol gates audit | TODO | Every `protocol.enabled()` check across compose, validate, parse, cross-message. A gate present in compose but missing in parse means attacker uses feature pre-activation. |
 | 9 | Authorization predicates | PARTIAL | Per-message audited (sweep, dispenser, send, fairmint). **TODO:** systematic sweep across every credit/debit/transfer/ownership-change for source verification. |
 | 10 | SQL invariants on snapshots | USER TASK | `SUM(credits) - SUM(debits)` per asset, no negative balances, no orphaned rows. Needs mainnet snapshot. |
-| 11 | Static analysis (Semgrep / CodeQL) | TODO | Both available via skills. Quick win. |
+| 11 | Static analysis (Semgrep / CodeQL) | **DONE — Semgrep clean** | Ran p/security-audit + p/python + p/owasp-top-ten + p/cwe-top-25 against `lib/`. 4 total warnings (2x dynamic-urllib in `cli/bootstrap.py`, 2x insecure-file-permissions `os.chmod(0o660)` in `bootstrap.py` + `setup.py`) — all already suppressed with `nosec`/`noqa` markers, all justified (signed snapshot downloads, intentional rw-group config files). CodeQL still TODO. |
 | 12 | Adversarial multi-agent review | DONE multiple rounds | Ultrareview + 12+ ad-hoc agents. ~50% FP rate on ad-hoc, ~0% FP on ultrareview. |
 
 ---
