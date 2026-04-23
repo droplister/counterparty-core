@@ -4,6 +4,7 @@ import struct
 import pytest
 from counterpartycore.lib import config, exceptions
 from counterpartycore.lib.messages import btcpay
+from counterpartycore.test.mocks.counterpartydbs import ProtocolChangesDisabled
 
 
 def test_unpack_valid():
@@ -256,30 +257,13 @@ def test_validate_pending_backward_btc(ledger_db, defaults, monkeypatch):
     assert len(problems) == 0
 
 
-def test_parse_attacker_diverts_btc_to_self(ledger_db, blockchain_mock, defaults, monkeypatch):
-    """Verification test for the suspected btcpay destination-check gap.
+def _attacker_btcpay_setup(ledger_db, blockchain_mock, defaults, monkeypatch):
+    """Shared setup for the attacker-diverts-btc-to-self scenario.
 
-    Setup:
-      - Order match where Alice (addresses[0]) escrowed 100 XCP and
-        Bob (addresses[1]) owes 1 BTC for it.
-      - Carol (addresses[2]) crafts a btcpay tx that pays 1 BTC to her
-        OWN address (not Alice) but includes the OP_RETURN with the
-        legitimate order_match_id.
-
-    With check_btcpay_source enabled (active mainnet since block 313900),
-    the source check in validate() is bypassed -- meaning ANY source can
-    submit a btcpay. parse() then checks `tx["btc_amount"] >= btc_quantity`
-    but does NOT verify that `tx["destination"]` matches the legitimate
-    counterparty's address (Alice).
-
-    If this test PASSES (Carol receives the 100 XCP credit), the bug is
-    real and a protocol-gated fix is warranted. If it FAILS or asserts
-    something else, the protective check exists somewhere we haven't
-    located -- in which case dig in.
+    Alice escrowed 100 XCP, Bob owes 1 BTC. Carol crafts a btcpay tx
+    that pays 1 BTC to her OWN address with the legitimate order_match_id
+    in OP_RETURN. Returns (tx, message, credits_list, carol_address).
     """
-    import binascii
-    import struct
-
     fake_order_match_id = (
         "0000000000000000000000000000000000000000000000000000000000000aaa_"
         "0000000000000000000000000000000000000000000000000000000000000bbb"
@@ -294,8 +278,8 @@ def test_parse_attacker_diverts_btc_to_self(ledger_db, blockchain_mock, defaults
                 "tx1_address": defaults["addresses"][1],  # Bob (owes BTC)
                 "forward_asset": "XCP",
                 "backward_asset": config.BTC,
-                "forward_quantity": 100000000,  # 1 XCP escrowed by Alice
-                "backward_quantity": 100000000,  # 1 BTC owed by Bob
+                "forward_quantity": 100000000,
+                "backward_quantity": 100000000,
                 "match_expire_index": 9999999,
             }
         ]
@@ -303,7 +287,6 @@ def test_parse_attacker_diverts_btc_to_self(ledger_db, blockchain_mock, defaults
     monkeypatch.setattr(
         "counterpartycore.lib.ledger.markets.get_order_match", mock_get_order_match
     )
-    # Avoid touching mark_order_as_filled / get_pending_order_matches plumbing
     monkeypatch.setattr(
         "counterpartycore.lib.ledger.markets.update_order_match_status", lambda *a, **kw: None
     )
@@ -314,51 +297,64 @@ def test_parse_attacker_diverts_btc_to_self(ledger_db, blockchain_mock, defaults
         "counterpartycore.lib.ledger.markets.mark_order_as_filled", lambda *a, **kw: None
     )
 
-    # Carol's tx: source = Carol, destination = Carol (NOT Alice), btc_amount sufficient
     carol = defaults["addresses"][2]
     tx = blockchain_mock.dummy_tx(
         ledger_db,
         carol,
         destination=carol,  # Pay to self instead of Alice
-        btc_amount=100000000,  # Sufficient to satisfy `>= btc_quantity`
+        btc_amount=100000000,
     )
-
-    # Construct the btcpay message with the legitimate order_match_id
     tx0_hash_bytes = binascii.unhexlify(fake_order_match_id[:64])
     tx1_hash_bytes = binascii.unhexlify(fake_order_match_id[65:])
     message = struct.pack(">32s32s", tx0_hash_bytes, tx1_hash_bytes)
 
-    # Capture credits made during parse
     credits = []
-    real_credit = btcpay.ledger.events.credit
     monkeypatch.setattr(
         "counterpartycore.lib.ledger.events.credit",
         lambda db, address, asset, quantity, *a, **kw: credits.append(
             (address, asset, quantity)
         ),
     )
+    return tx, message, credits, carol
 
-    btcpay.parse(ledger_db, tx, message)
 
-    # If the bug is real: Carol gets credited 1 XCP (100000000 satoshi-XCP)
-    # If the bug isn't real: credits list will NOT contain (carol, XCP, ...)
-    carol_got_credit = any(
+def test_btcpay_attacker_diverts_with_gate_OFF_legacy_behavior(
+    ledger_db, blockchain_mock, defaults, monkeypatch
+):
+    """Pre-fix legacy behavior: with `check_btcpay_destination` OFF (the
+    state of every block before the gate's activation), parse credits the
+    attacker. This pins the historical buggy behavior so the gated fix
+    cannot accidentally change consensus for past blocks.
+    """
+    tx, message, credits, carol = _attacker_btcpay_setup(
+        ledger_db, blockchain_mock, defaults, monkeypatch
+    )
+    with ProtocolChangesDisabled(["check_btcpay_destination"]):
+        btcpay.parse(ledger_db, tx, message)
+    assert any(
         addr == carol and asset == "XCP" and qty == 100000000 for addr, asset, qty in credits
+    ), (
+        "Pre-fix legacy behavior violated: with the gate OFF, parse should "
+        "still credit the attacker (preserving historical consensus). If this "
+        "asserts, the fix is firing when the gate is supposed to be off."
     )
 
-    # We assert the OBSERVED behavior with a clear message either way.
-    if carol_got_credit:
-        # BUG CONFIRMED: parse() credited Carol from Alice's escrow with no
-        # check that the BTC actually went to Alice.
-        assert False, (
-            "BUG CONFIRMED: btcpay.parse credited the attacker (Carol) with "
-            f"the escrowed XCP. credits list: {credits}. "
-            "Fix: enforce tx['destination'] == validated destination, "
-            "gated behind a new protocol_changes.json entry."
-        )
-    else:
-        # Bug NOT reproducible at the unit-test level. The protective
-        # check exists somewhere we haven't located. Document so future
-        # readers know this attack was investigated and refuted here.
-        # Test passes (no bug to fix), but the behavior is recorded.
-        pass
+
+def test_btcpay_attacker_diverts_with_gate_ON_rejects(
+    ledger_db, blockchain_mock, defaults, monkeypatch
+):
+    """Post-fix behavior: with `check_btcpay_destination` ON (active by
+    default in tests since signet activation block is 0), parse rejects
+    the attacker tx as 'invalid: btc payment destination does not match
+    order match counterparty' and DOES NOT credit Carol.
+    """
+    tx, message, credits, carol = _attacker_btcpay_setup(
+        ledger_db, blockchain_mock, defaults, monkeypatch
+    )
+    btcpay.parse(ledger_db, tx, message)
+    assert not any(
+        addr == carol and asset == "XCP" and qty == 100000000 for addr, asset, qty in credits
+    ), (
+        "Fix did not block the attacker: with check_btcpay_destination ON, "
+        f"parse credited the attacker. credits list: {credits}"
+    )
