@@ -5,7 +5,6 @@ import logging
 import time
 
 from counterpartycore.lib import config
-from counterpartycore.lib.utils import database
 from yoyo import step
 
 logger = logging.getLogger(config.LOGGER_NAME)
@@ -31,47 +30,41 @@ def apply(db):
     start_time = time.time()
     logger.debug("Re-deriving assets_info latest-issuance columns...")
 
-    ledger_db = database.get_db_connection(config.DATABASE)
-    cursor = ledger_db.cursor()
+    # ATTACH the ledger DB so we can JOIN against issuances directly --
+    # mirrors the pattern in 0006 (which ATTACHes ledger_db and does the
+    # whole derivation as a single UPDATE-FROM via correlated subqueries).
+    db.execute("ATTACH DATABASE ? AS ledger_db", (config.DATABASE,))
 
-    # Per-asset latest-valid-issuance row, keyed by MAX(rowid).
-    cursor.execute(
+    db.execute(
         """
-        SELECT i.asset, i.description, i.divisible, i.mime_type, i.issuer AS owner
-        FROM issuances i
-        JOIN (
-            SELECT asset, MAX(rowid) AS max_rowid
-            FROM issuances
-            WHERE status = 'valid'
-            GROUP BY asset
-        ) latest ON latest.max_rowid = i.rowid
-        """
-    )
-    rows = cursor.fetchall()
-    cursor.close()
-
-    update_cursor = db.cursor()
-    update_cursor.execute("BEGIN")
-    try:
-        for row in rows:
-            update_cursor.execute(
-                """
-                UPDATE assets_info
-                SET description = ?, divisible = ?, mime_type = ?, owner = ?
-                WHERE asset = ?
-                """,
-                (row[1], row[2], row[3], row[4], row[0]),
+        UPDATE assets_info SET
+            description = (
+                SELECT i.description FROM ledger_db.issuances i
+                WHERE i.asset = assets_info.asset AND i.status = 'valid'
+                ORDER BY i.rowid DESC LIMIT 1
+            ),
+            divisible = (
+                SELECT i.divisible FROM ledger_db.issuances i
+                WHERE i.asset = assets_info.asset AND i.status = 'valid'
+                ORDER BY i.rowid DESC LIMIT 1
+            ),
+            mime_type = (
+                SELECT i.mime_type FROM ledger_db.issuances i
+                WHERE i.asset = assets_info.asset AND i.status = 'valid'
+                ORDER BY i.rowid DESC LIMIT 1
+            ),
+            owner = (
+                SELECT i.issuer FROM ledger_db.issuances i
+                WHERE i.asset = assets_info.asset AND i.status = 'valid'
+                ORDER BY i.rowid DESC LIMIT 1
             )
-        update_cursor.execute("COMMIT")
-    except Exception:
-        update_cursor.execute("ROLLBACK")
-        raise
-    finally:
-        update_cursor.close()
-
-    logger.debug(
-        "Re-derived %d assets_info rows in %.2f seconds", len(rows), time.time() - start_time
+        WHERE asset NOT IN ('XCP', 'BTC')
+        """
     )
+
+    db.execute("DETACH DATABASE ledger_db")
+
+    logger.debug("Re-derived assets_info rows in %.2f seconds", time.time() - start_time)
 
 
 def rollback(db):

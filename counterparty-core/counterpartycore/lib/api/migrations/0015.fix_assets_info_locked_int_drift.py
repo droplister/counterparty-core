@@ -5,7 +5,6 @@ import logging
 import time
 
 from counterpartycore.lib import config
-from counterpartycore.lib.utils import database
 from yoyo import step
 
 logger = logging.getLogger(config.LOGGER_NAME)
@@ -32,38 +31,29 @@ def apply(db):
     start_time = time.time()
     logger.debug("Re-deriving assets_info.locked + description_locked as booleans...")
 
-    ledger_db = database.get_db_connection(config.DATABASE)
-    cursor = ledger_db.cursor()
+    db.execute("ATTACH DATABASE ? AS ledger_db", (config.DATABASE,))
 
-    cursor.execute(
+    db.execute(
         """
-        SELECT asset, MAX(locked) AS locked, MAX(description_locked) AS description_locked
-        FROM issuances
-        WHERE status = 'valid'
-        GROUP BY asset
+        UPDATE assets_info SET
+            locked = COALESCE(
+                (SELECT MAX(i.locked) FROM ledger_db.issuances i
+                 WHERE i.asset = assets_info.asset AND i.status = 'valid'),
+                locked
+            ),
+            description_locked = COALESCE(
+                (SELECT MAX(i.description_locked) FROM ledger_db.issuances i
+                 WHERE i.asset = assets_info.asset AND i.status = 'valid'),
+                description_locked
+            )
+        WHERE asset NOT IN ('XCP', 'BTC')
         """
     )
-    rows = cursor.fetchall()
-    cursor.close()
 
-    update_cursor = db.cursor()
-    update_cursor.execute("BEGIN")
-    try:
-        for row in rows:
-            update_cursor.execute(
-                "UPDATE assets_info SET locked = ?, description_locked = ? WHERE asset = ?",
-                (row[1], row[2], row[0]),
-            )
-        update_cursor.execute("COMMIT")
-    except Exception:
-        update_cursor.execute("ROLLBACK")
-        raise
-    finally:
-        update_cursor.close()
+    db.execute("DETACH DATABASE ledger_db")
 
     logger.debug(
-        "Re-derived assets_info.locked + description_locked for %d rows in %.2f seconds",
-        len(rows),
+        "Re-derived assets_info.locked + description_locked in %.2f seconds",
         time.time() - start_time,
     )
 
