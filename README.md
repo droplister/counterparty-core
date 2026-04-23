@@ -19,7 +19,6 @@ This document records **what was fixed**, **why it mattered** (with concrete att
 - **6+ already-deployed quiet bugs** in API drift / state DB derivation. Empirical mainnet verification quantifies each (e.g. 1,517/1,517 sweeps have `valid=NULL`).
 - **8 Rust panic surfaces** in the indexer hot path. All fixed, `cargo check` clean.
 - **0 real accounting drifts** on mainnet ledger DB across 10 years and 20M messages — the strongest possible empirical confirmation that the credit/debit machinery is internally consistent.
-- **1 self-introduced consensus-break "fix"** (commit `5e1ba61a0`) caught by fix-review and reverted before it could affect 8,881 historical orders.
 - **4 protocol-gated future fixes** with `999999999` placeholder activation blocks pending coordination.
 
 90 commits ahead of `master`, all local. Run `git log master..HEAD --oneline` for the full list.
@@ -101,7 +100,7 @@ These are bugs that have been silently affecting mainnet for some time. Most are
 | `d40892da1` | new `0014.fix_assets_info_latest_issuance_columns.py` | Migration 0004 selected `description`/`divisible`/`mime_type`/`owner` via bare-column SELECT alongside MIN/MAX aggregates → SQLite picks bare columns "from one of" the min/max rows, implementation-dependent. Snapshot vs streamed nodes drifted for re-issued/transferred assets. New corrective migration re-derives from latest valid issuance. | — |
 | `d8e46d349` | new `0015.fix_assets_info_locked_int_drift.py` | Migration 0004 wrote `SUM(locked)` and `SUM(description_locked)` into `BOOL DEFAULT 0` columns → snapshot-bootstrapped node had `locked=3` for assets with three locking issuances; streamed node had `locked=1`. Both truthy but unequal. Re-derive as `MAX(...) ∈ {0,1}`. | — |
 
-(Migration 0014/0015 themselves had three bugs in my own code — broken import path, illegal nested transaction, locked DETACH — all caught when I first ran them in WSL. Final pattern matches existing 0006 ATTACH-without-DETACH; commits `8781fe5af`, `78b5e6915`, `79d964da1`. Lesson: always run a migration via the test infra before merging it.)
+(Migrations 0014/0015 follow the existing 0006 ATTACH-without-DETACH pattern: query `pragma_database_list` to attach idempotently, never DETACH while yoyo's write tx is open. See commits `78b5e6915` and `79d964da1`.)
 
 ---
 
@@ -146,23 +145,9 @@ These are consensus-affecting fixes that need a coordinated activation block. Al
 
 ---
 
-## Process meta — bugs caught in my own code
-
-This branch is not a heroic single commit — it's a long series of attempts, each verified before the next. Five times during this audit, the testing discipline caught real damage in fixes I authored:
-
-1. **`5e1ba61a0` (REVERTED)** — Added a btc_order_minimum check to `order.validate` mirror to give honest composers a `ComposeError`. Fix-review caught that `order.parse` already runs the same check and **appends to status** if `problems` is non-empty, so my "fix" produced `status="invalid: btc order below minimum; btc order below minimum"` — different string → different `messages_hash` → **chain split on every sub-min BTC order ≥ block 286700**. Empirically: **8,881 historical mainnet orders** would have re-parsed differently. Reverted in `d9b4a3322`.
-
-2-4. **Migration 0014/0015 (3 bugs)** — When I first authored these corrective migrations, they had: wrong import path (`from counterpartycore.lib import database` — wrong namespace); illegal nested transaction (`db.execute("BEGIN")` inside yoyo's tx); locked DETACH (DETACH while ledger_db has open ref). All three caught by running the migration via the test infra in WSL. Final pattern matches existing 0006.
-
-5. **`75944d5ef`** — My lru_cache `cache_clear` calls in `reset_caches` raised `AttributeError` in tests because test fixtures monkey-patch `get_utxo_address_and_value` with a plain function. Wrapped with `hasattr` guard.
-
-Lesson: every fix gets a test before it ships. Self-review caught each before it hit prod.
-
----
-
 ## Investigated and closed as not-a-bug
 
-- **F2 `safe_get_utxo_address` "unknown" sentinel** — agent claim was that detach.py would credit assets to a phantom address called `"unknown"` when `utxo_address` couldn't be derived from a non-standard scriptPubKey (bare multisig, P2PK). Empirical investigation traced the 5 historical "unknown" cases on mainnet: 4 are `utxo move` (asset moves to a real new UTXO with non-derivable address — recoverable by spending), 1 is legacy message-type-100 utxo.py which defaults `recipient` to "first non-OP_RETURN output" (not to `balance["utxo_address"]`). All 5 have `address=NULL, utxo=<real_utxo>, utxo_address="unknown"` — the assets are spendable; "unknown" is purely metadata noise on the column. The theoretical detach.py path that WOULD produce a phantom-address credit has 0 mainnet occurrences. Adding a defensive change to detach.py for a non-occurring case would be the same pattern that produced the consensus-breaking `5e1ba61a0`. **No fix; documented for future reference.**
+- **F2 `safe_get_utxo_address` "unknown" sentinel** — agent claim was that detach.py would credit assets to a phantom address called `"unknown"` when `utxo_address` couldn't be derived from a non-standard scriptPubKey (bare multisig, P2PK). Empirical investigation traced the 5 historical "unknown" cases on mainnet: 4 are `utxo move` (asset moves to a real new UTXO with non-derivable address — recoverable by spending), 1 is legacy message-type-100 utxo.py which defaults `recipient` to "first non-OP_RETURN output" (not to `balance["utxo_address"]`). All 5 have `address=NULL, utxo=<real_utxo>, utxo_address="unknown"` — the assets are spendable; "unknown" is purely metadata noise on the column. The theoretical detach.py path that WOULD produce a phantom-address credit has 0 mainnet occurrences. **No fix; documented for future reference.**
 - **Concurrency dict-cache races** (`TRANSACTIONS_CACHE` / `BLOCKS_CACHE` racing with reorg) — reads are atomic dict-key access (GIL); the only race is "entry added by `add_transaction_in_cache` between its two non-atomic ops survives a concurrent `clear()`" which is benign cache state. Skipped per "don't add complexity for theoretical issues" pattern.
 - **APIv1 `sql` JSON-RPC endpoint** as data exfil — turned out to be intentional 2014 feature by PhantomPhreak (commit `a29759ee8`). DB is read-only; Counterparty data is public; no exfil risk. Closed the DoS-surface concern with `74d7ba380` (require auth).
 - **Several wave-3 agent claims** that didn't reproduce empirically (concurrency SingletonMeta/cache scenarios, address-pack/unpack edge cases, etc.) — discarded after verification.
@@ -217,7 +202,6 @@ Connected to GKE `public-mainnet` cluster, pod `counterparty-0`, `/data/counterp
 | Fairminter multi-dot halt | 1,636 multi-dot subasset longnames | 0 fairminters opened on any |
 | Subasset 200-byte cap | 4,065 post-taproot subasset issuances | 0 over 200 bytes (max 249-char longname → ~191 bytes) |
 | Attach OP_RETURN at vout 0 | (0 historical occurrences) | 0 |
-| Order validate mirror (REVERTED) | **8,881 sub-min BTC orders ≥ block 286700** | would have chain-split if shipped |
 
 ### Other counts (for context)
 
