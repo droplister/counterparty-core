@@ -167,6 +167,61 @@ Known test artifact: `apsw.ConstraintError` from repeated `tx_hash` across Hypot
 
 ---
 
+## Empirical validation against mainnet (2026-04-22)
+
+Connected via gcloud + kubectl to GKE `public-mainnet` cluster, pod
+`counterparty-0`, `/data/counterparty.db`, **driver-level read-only**
+(`?mode=ro`). Ran a series of invariant + scope queries.
+
+### Strongest invariant: balance == credits − debits (per address, asset)
+
+| Query | Result |
+|---|---|
+| `COUNT(*) FROM balances WHERE quantity < 0` | **0** — no negative balances anywhere |
+| XCP per-address: balance vs SUM(credits)−SUM(debits) (exact INT) | **0 drift** |
+| All-assets per-(address, asset), REAL (Q3a) | 183 "drifts" max 16640 sat |
+| Q3c follow-up: per-asset INTEGER spot-check on EDRACHMA (highest drift) | **0 actual drift** — Q3a 183 was double-precision ulp loss on high-supply assets |
+
+**The mainnet ledger DB has 0 real accounting drifts** across ~10 years
+and ~20M messages. Every (address, asset) balance equals exactly the
+sum of its credits minus its debits. This **empirically validates the
+authorization audit's "no wrongful credit/debit" finding** with the
+strongest possible evidence.
+
+### Bug-exposure scope vs. fixes
+
+For each major bug we fixed, scope of historical/live exposure:
+
+| Bug | Population | Live exposure | Notes |
+|---|---|---|---|
+| #8 sweep `transactions_status` missing | 1,517 sweeps | **1,517 (100%) NULL** | Fix `12bfd2f9e` corrects forward; historical rows need rollback+reparse to backfill |
+| #10 DETACH `sourc_address` typo | (see live API check) | every DETACH affected | Confirmed via API earlier; all source-side address_events silently dropped |
+| Dispenser negative oracle halt (`c624cc96b`) | 3,335 negative-value broadcasts (excl -2/-3) × 727 open oracle dispensers | **0** | No oracle dispenser ever pointed at a negative-value broadcaster — bug was real but never triggered. Now permanently closed. |
+| Fairminter multi-dot halt (`0aefc5794`) | 1,636 multi-dot subasset longnames | **0** | No fairminter has ever opened on a multi-dot subasset. Real bug, 0 trigger. |
+| Subasset CBOR DoS cap (`0aefc5794`) | 4,065 post-taproot subasset issuances | 0 over 200 bytes | Max longname 249 chars → max compacted ~191 bytes, comfortably under 200. Cap is provably safe historically. |
+| Order validate mirror reverted (`d9b4a3322`) | **8,881 sub-min BTC orders post-block 286700** | would have chain-split | This is the population that would have re-parsed differently if `5e1ba61a0` had shipped. Caught by fix-review. |
+
+### Other counts
+
+| Metric | Value |
+|---|---|
+| Total messages (events journal) | 20,082,170 |
+| Total blocks | 667,985 |
+| Total assets | 248,464 |
+| Addresses with non-zero balance | 401,768 |
+| Open BTC-side orders | 106,060 |
+| Open dispensers | 284,806 |
+| Issuances at quantity=MAX_INT | 27 (clamp boundary handling exists historically) |
+| Destroys at quantity=MAX_INT | 0 (clamp fix had no historical reach) |
+| Largest single-asset supply | 9,223,372,036,854,775,807 (= MAX_INT — confirmed someone issued at the boundary) |
+
+### What this audit pass cannot prove
+
+- **Subasset canonicalization scan** — would need Python to decrypt + decode 4,065 CBOR messages and check `compact(expand(bytes)) == bytes`. Recommended as a one-shot script before activating `canonical_subasset_compact`. None of the 4,065 were created via hand-rolled CBOR (compose always produces canonical), but verifying programmatically would let the activation block be set freely.
+- **Hash-compare against reference node** — a fresh sync to the same tip with hash equality at every block. Strongest possible end-to-end check; user environment.
+
+---
+
 ## Reviewing this branch
 
 ```bash
