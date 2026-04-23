@@ -21,6 +21,10 @@ MIGRATIONS_AFTER_ROLLBACK = [
     "0009.create_and_populate_transaction_types_count",
     "0011.create_orders_views",
     "0013.add_performance_indexes",
+    # 0014 + 0015 are corrective re-derivations that must run after every
+    # rollback so the bare-column / SUM-as-int drift doesn't reappear.
+    "0014.fix_assets_info_latest_issuance_columns",
+    "0015.fix_assets_info_locked_int_drift",
 ]
 
 ROLLBACKABLE_TABLES = [
