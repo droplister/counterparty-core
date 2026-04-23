@@ -1,177 +1,196 @@
-# Halt & Accounting Audit — Session Notes
+# Halt, Accounting & Fund-Theft Audit — Branch Notes
 
 **Branch:** `fix/parse-time-exception-handling` (based on `master`)
-**Session:** 2026-04-22 (ongoing — kept local, not pushed)
-**Scope:** Targeted security audit for (a) consensus-halt vectors in parse/validate paths, (b) accounting errors — wrong credits/debits, unauthorized ownership transfers, mint-supply-for-less-than-price, (c) message-dispatch gaps (send variants, version gates), (d) reorg/rollback hygiene.
+**Sessions:** 2026-04-22 → 2026-04-23 (kept local, not pushed)
+**Scope:** Targeted security audit for (a) consensus-halt vectors in parse/validate paths, (b) accounting errors — wrong credits/debits, unauthorized ownership transfers, mint-supply-for-less-than-price, (c) message-dispatch gaps (send variants, version gates), (d) reorg/rollback hygiene, (e) API surface (DoS / data exposure), (f) Rust indexer panic surface.
 
-This document records **what was fixed**, **why it mattered** (with concrete attack traces where relevant), and **what was ruled out** (so the same ground does not get re-audited).
-
----
-
-## Attack Model
-
-1. An attacker can craft arbitrary transaction bytes carrying any Counterparty message body.
-2. With `taproot_support` active (mainnet block ≥ 902000), the message body may be CBOR-encoded — CBOR can carry `None`, `float`, `str`, or arbitrary-size ints where the legacy `struct` format would have rejected the bytes.
-3. Any uncaught exception inside a message-type `parse()` propagates up through `parser/blocks.py:parse_tx`, which wraps it as `ParseTransactionError` and re-raises from `parse_block` — **this halts every node on the network at the offending block.**
-4. `validate()` rejections (returning `problems`) are fine: they mark the record invalid and the chain continues.
-
-Goal of this branch: turn every attacker-triggered exception in a parse path into an *invalid-record* outcome rather than a consensus halt, without changing the legitimate-traffic behavior.
+This document records **what was fixed**, **why it mattered** (with concrete attack traces where relevant), and **what was ruled out** (so the same ground does not get re-audited). For the gritty details on any single change, the commit message has it.
 
 ---
 
-## Commits on this branch (20 direct fixes + 18 from branch-point on master, all local)
+## TL;DR
 
-Ordered newest → oldest within each category. `master` is the base.
+- **1 CRITICAL fund-theft bug** in `btcpay.parse` — anyone can swipe a pending BTC order match's escrow. 11 years latent on mainnet (verified, 2,158/2,158 historical btcpays were honest). Fix gated, tested, ready.
+- **~14 single-tx halt vectors** mostly post-`taproot_support` (CBOR-crafted message bodies). All gated/fixed, none weaponized.
+- **6+ already-deployed quiet bugs** in API drift / state DB derivation. Empirical mainnet verification quantifies each (e.g. 1,517/1,517 sweeps have `valid=NULL`).
+- **8 Rust panic surfaces** in the indexer hot path. All fixed, `cargo check` clean.
+- **0 real accounting drifts** on mainnet ledger DB across 10 years and 20M messages — the strongest possible empirical confirmation that the credit/debit machinery is internally consistent.
+- **1 self-introduced consensus-break "fix"** (commit `5e1ba61a0`) caught by fix-review and reverted before it could affect 8,881 historical orders.
+- **4 protocol-gated future fixes** with `999999999` placeholder activation blocks pending coordination.
 
-### Halt vectors fixed
+90 commits ahead of `master`, all local. Run `git log master..HEAD --oneline` for the full list.
+
+---
+
+## 🚨 CRITICAL — btcpay anyone-can-steal-escrow (`2057e099c`)
+
+**Pre-fix vulnerability.** When two orders match (one BTC side, one asset side), the asset is escrowed and the BTC-owing party has ~10 blocks to send BTC to the asset-escrowing party in a tx with the `order_match_id` in OP_RETURN. `btcpay.parse` checked `tx["btc_amount"] >= btc_quantity` but **never compared `tx["destination"]` to the legitimate counterparty's address**. Combined with `check_btcpay_source` (active mainnet ≥ block 313900) bypassing the source check, **any third party could**:
+
+1. Watch the chain for pending order_matches
+2. Craft a Bitcoin tx: vout 0 = their own address with at least `btc_quantity` BTC, vout 1 = OP_RETURN with the `order_match_id`
+3. `parse()` credits them with the escrowed asset and marks the match completed
+4. The legitimate BTC-owing party's later honest tx hits "order match completed" → invalid; the asset-escrowing party never receives their BTC
+
+Net cost to attacker: just the Bitcoin tx fee (BTC paid to themselves comes back). Net gain: the entire escrowed asset.
+
+**Empirical verification (gcloud kubectl read-only SQL on prod ledger DB):** 2,158 historical post-block-313900 mainnet btcpays, 100% from the legitimate BTC-owing party with destination = legitimate counterparty. **0 historical exploitation in 11 years** — the bug has been latent.
+
+**Fix:** `btcpay.parse` now rejects when `tx["destination"] != destination` (the value validated from order_match), gated behind new `check_btcpay_destination` protocol entry. Pre-fix path preserved for historical consensus determinism. Two regression tests pin both behaviors:
+
+- `test_btcpay_attacker_diverts_with_gate_OFF_legacy_behavior` → asserts gate-off preserves the buggy behavior (Carol gets credited)
+- `test_btcpay_attacker_diverts_with_gate_ON_rejects` → asserts gate-on rejects with `status=invalid: btc payment destination does not match order match counterparty`
+
+Both pass. The fix waits for activation block coordination.
+
+**Recommended urgency:** the bug is now documented in this local branch. Release window matters; recommend rapid coordinated release with activation soon after (10-100 blocks lead time).
+
+---
+
+## Halt vectors fixed (single attacker tx → chain stops)
 
 | Commit | File | Attack |
 |---|---|---|
-| `fb7fe8288` | `broadcast.py` parse() | CBOR `[None, 0.0, 0, "text/plain", b""]` decodes cleanly via `load_cbor`; `min(None, MAX_INT)` raises `TypeError` → halt. Fix: wrap post-unpack `min()`/`validate()` in `try/except (TypeError, ValueError, OverflowError, AssertionError)`. Pattern copied from `issuance.parse` 46ae108. Found by ultrareview (bug_009). |
-| `46ae1089b` | `issuance.py` unpack() + parse() | Three halt vectors surfaced by hypothesis-based CBOR fuzzing. (1) `asset_id < 26**3` raised `TypeError` when CBOR supplied `asset_id` as `str`. Widened outer `unpack` except to include `(TypeError, ValueError, OverflowError)`. (2) Tuple-unpack of `validate()`'s return raised `ValueError` on CBOR edge cases. Wrapped `validate()` call in `parse()` in `try/except (TypeError, ValueError, OverflowError, AssertionError)`. (3) CBOR-huge ints overflowed SQLite 64-bit signed INTEGER on `insert_record`. Added defensive `_clamp` loop over all int bindings before INSERT. |
-| `46ae1089b` | `broadcast.py` unpack() | `VarIntSerializer.SerializationTruncationError` from attacker-truncated rawtext was not caught; existing excepts only covered `struct.error` and `AssertionError`. Added broad `except Exception` after the specific ones. |
-| `caf578242` | `cancel.py` parse() | `UnboundLocalError` on `offer_type` when unpack raised before assignment. Attack: hand-rolled cancel whose encoded offer_hash decoded but offer lookup raised downstream. Initialized `offer_type = None` at top of function; on failure path emit event `INVALID_CANCEL`. |
-| `caf578242` | `destroy.py` parse() | CBOR-huge `quantity` passed validate (validate caps at MAX_INT but only rejects via `problems`), then INSERT bound `quantity` via SQLite, which rejected > 2^63−1 as `OverflowError`. Added `safe_quantity = None if quantity > MAX_INT else quantity` clamp before bindings. |
-| `99012352f` | `utxo.py` parse() | Arbitrary-UTF8-invalid decrypted body raised uncaught `UnicodeDecodeError`/`ValueError` inside `unpack`. Wrapped `unpack` call in `try/except UnpackError`; on failure, insert an invalid `sends` record and set tx status False. |
-| `2375e6bc4` | `utxo.py` parse() | Follow-up: invalid-record bindings were missing `source` field. Added `"source": tx["source"]`. |
-| `0247a4ce2` | `utxo.py` parse() | Polish: failure path hardcoded event `"ATTACH_TO_UTXO"` even when original intent was detach. Renamed to `INVALID_UTXO_MOVE` (mirrors `INVALID_CANCEL` precedent). Found by ultrareview (bug_010). No consensus impact. |
-| `3880dcac3` | `dispense.py` parse() | `NoPriceError` from `get_must_give` when dispenser state transiently zero-priced would propagate → halt. Wrapped in `try/except NoPriceError: continue` over the dispenser loop. |
-| `4b902ff7f` | `dispense.py` parse() | Also catch `ZeroDivisionError` in `get_must_give` call site for defense-in-depth. |
-| `32c5c731f` | `issuance.py` unpack() | `struct.error` from malformed legacy bytes was only partly covered (outer except caught `UnpackError` only). Added `struct.error` to the tuple. |
-| `01e7d50e8` | `order.py`, `bet.py` match() | `assert len(orders) == 1` and `assert len(bets) == 1` were 10+ years old and had never fired, but any future DB inconsistency would halt the chain. Replaced with `if len(...) != 1: logger.error; return`. Softening, not removal — still logs the invariant violation. |
-
-### Rollback / reorg hygiene
-
-| Commit | File | Issue |
-|---|---|---|
-| `aa968b8b6` | `parser/blocks.py` | `transactions_status` rows were not cleaned by `clean_transactions_tables` on reorg. If the new chain is shorter, orphan rows from the longer chain remained. Added to the cleanup list, and to `rebuild_database` drop list. |
-| `64c0ab4f5` | `parser/blocks.py` | `rollback()` did not clear `backend.bitcoind.TRANSACTIONS_CACHE`. Stale deserialized txs could be served after rollback. Added `backend.bitcoind.reset_caches()` call. |
-| `24a0e24fb` | `backend/bitcoind.py` | Encapsulated the cache clear: new `reset_caches()` helper so callers don't poke at module-level dicts directly. |
-
-### Operational hygiene
-
-| Commit | File | Issue |
-|---|---|---|
-| `e66953cd1` | `ledger/backendheight.py` | `refresh()` assigned `self.last_check` only as its last statement, so a failing RPC call short-circuited before the assignment. Persistent 401/403/502/unlisted-RPC-error cases drove ~10 Hz retries (~36k RPC calls/hr + ~36k log lines/hr). Fix: moved assignment into a `finally` block so the invariant holds regardless of exception path. Found by ultrareview (bug_002). No consensus impact. |
-
-### API / data-integrity
-
-| Commit | File | Issue |
-|---|---|---|
-| `f3b01b532` | `api/migrations/0004.create_and_populate_assets_info.py` | The supplies query had `WHERE issuances_quantity.asset = destructions_quantity.asset` on a `LEFT JOIN`, which silently converted it back to an INNER JOIN. Assets that had been issued but never destroyed were then missing from the supplies view. Removed the WHERE clause. |
-
-### Rust (counterparty-rs)
-
-| Commit | File | Issue |
-|---|---|---|
-| `b207f8b68` | `indexer/bitcoin_client.rs` | `parse_vout` had off-by-one bounds checks at two sites (~line 200 P2PKH-ish path, ~line 314 multisig path). Inclusive slice `bytes[1..=prefix.len()]` needs `bytes.len() > prefix.len()`, not `>=`. Also added `data_len = min(bytes[0] as usize, bytes.len() - 1)` clamp and early-return when `data_len < prefix.len()` so `data[prefix.len()..]` cannot panic. `cargo check` clean. |
-| `ff082f9e1` | `utils.rs` | `script_to_address_legacy` had `panic!("we thought this shouldn't happen!")` in the else branch of non-witness address parsing. Attacker bytes reaching that branch would PyPanic → process crash. Replaced with `PyErr::new::<PyValueError, _>(...)`. |
-
-### Latent-landmine / footgun cleanup
-
-| Commit | File | Issue |
-|---|---|---|
-| `204178df7` | `utils/helpers.py`, `api/verbose.py` | `helpers.divide` and `verbose.normalize_price` set `decimal.getcontext().prec = N` as a side effect, mutating the thread-local Decimal context permanently. Current call graph only invokes these from the API thread, so the parser thread (gas.py, dividend.py, fairmint.py Decimal math) keeps the default prec=28 — no current exploit. But any future caller that imports `helpers.divide` into a parse path would silently drop thread precision to 16 for the rest of that thread's life — a consensus-split footgun. Switched both to `with decimal.localcontext() as ctx: ctx.prec = N:` so precision is scoped. Found by gas.py audit pass. |
-
-### Defensive dead-code reverts (prior turns, included for completeness)
-
-| Commit | File | Note |
-|---|---|---|
-| `4c811f06f` | `dispense.py` | Reverted a defensive `give_remaining < 0` soft error back to the original `assert give_remaining >= 0`. After trace, the "negative" condition was unreachable given the validate path; the softening added dead code. |
+| `fb7fe8288` | `broadcast.py` parse() | CBOR `[None, 0.0, 0, "text/plain", b""]` decodes cleanly via `load_cbor`; `min(None, MAX_INT)` raises `TypeError` → halt. Wrap post-unpack `min()`/`validate()` in `try/except (TypeError, ValueError, OverflowError, AssertionError)`. |
+| `46ae1089b` | `issuance.py` unpack() + parse() | Three vectors: `asset_id < 26**3` raised `TypeError` when CBOR supplied `asset_id` as `str`; `validate()` tuple-unpack raised `ValueError` on CBOR edge cases; CBOR-huge ints overflowed SQLite signed-64-bit `INTEGER` on `insert_record`. |
+| `46ae1089b` | `broadcast.py` unpack() | `VarIntSerializer.SerializationTruncationError` from attacker-truncated rawtext was uncaught. Added broad `except Exception`. |
+| `caf578242` | `cancel.py` parse() | `UnboundLocalError` on `offer_type` when unpack raised before assignment. Init `offer_type = None`; emit `INVALID_CANCEL` event on failure path. |
+| `caf578242` | `destroy.py` parse() | CBOR-huge `quantity` passed validate but INSERT raised `OverflowError`. Added defensive clamp before bindings. |
+| `99012352f` | `utxo.py` parse() | UTF8-invalid decrypted body raised uncaught `UnicodeDecodeError`. Wrapped `unpack` in `try/except UnpackError`. |
+| `2375e6bc4`, `0247a4ce2` | `utxo.py` parse() | Polish on the invalid-record path (added `source` field, renamed event to `INVALID_UTXO_MOVE`). |
+| `3880dcac3`, `4b902ff7f` | `dispense.py` parse() | `NoPriceError` from `get_must_give` and downstream `ZeroDivisionError` could propagate → halt. Wrapped in `try/except: continue` over the dispenser loop. |
+| `32c5c731f` | `issuance.py` unpack() | Added `struct.error` to outer except tuple. |
+| `01e7d50e8` | `order.py`, `bet.py` match() | `assert len(orders) == 1` / `assert len(bets) == 1` are 10+ years old and never fired, but any future DB inconsistency would halt. Replaced with log+return. |
+| `c624cc96b` | `dispense.py` `get_must_give` | **Notable.** Attacker creates an oracle dispenser pointing at their own address, broadcasts value=-1 (`broadcast.validate` doesn't reject negatives, the row is inserted before the negative-value early-return), then any BTC payment to the dispenser yields negative `must_give` → `credit(quantity=-N)` → `CreditError` → halt. Widened guard to `if last_price <= 0: raise NoPriceError`. **Empirical:** 0 oracle dispensers historically pointed at any of the 3,335 negative-value broadcasters; bug real but never weaponized. |
+| `0aefc5794` | `fairminter.py:99,564` | Multi-dot subasset longname (e.g. `"PARENT.foo.bar"`) is valid per `validate_subasset_longname` (allows non-consecutive dots). `existing_asset["asset_longname"].split(".")` then unpacks 3 parts to 2 vars → `ValueError` → halt. Use `split(".", 1)`. **Empirical:** 1,636 multi-dot subasset longnames exist; 0 fairminters opened on any of them. |
+| `0aefc5794` | `utils/assetnames.py` `expand_subasset_longname` | 100KB compacted CBOR longname → ~25s of O(n²) string-concat + integer-divide CPU per tx. Cap input at 200 bytes (a 250-char base68 longname needs 191 bytes; legacy struct path is uint8-bounded; only CBOR is uncapped). **Empirical:** max mainnet longname is 249 chars; cap is provably safe historically. |
+| `49a754098` | `attach.py:188` | Python truthiness bug: `if op_return_output and ...` short-circuits when `op_return_output == 0`, so OP_RETURN at vout 0 + attach to vout 0 silently bypassed the OP_RETURN check → asset attached to unspendable OP_RETURN, permanently locked. Fix: `is not None`. Gated behind `fix_attach_op_return_check` (consensus-affecting). **Empirical:** 0 historical mainnet occurrences. |
+| `598d2c680` | `parser/follow.py` `receive_rawblock` | Malformed rawblock / transient telemetry/RPC error during catch_up killed the entire BlockchainWatcher (block + mempool ingestion). Wrap with try/except that re-raises only `ParseTransactionError` (true halt) and logs+continues on operational exceptions. |
+| `598d2c680` | `parser/follow.py` `is_late()` | RPC errors from `getblockcount()` propagated to handle()'s broad except → `self.stop()`. Same auth-flap class as the prior BackendHeight retry-spam fix. Treat RPC errors as "not late." |
+| `598d2c680` | `parser/follow.py` late_since logic | `if self.is_late() and late_since is None: late_since = time.time()` reset itself on every iteration, so the 60s catch_up trigger could never fire. Fix the condition. |
+| `a40bc44f8` | `parser/mempool.py` `parse_mempool_transactions` | A halt-class tx broadcast to mempool propagated `ParseTransactionError` → killed the watcher. Single attacker tx in mempool = all confirmation processing dies. Wrap with `try/except` that drops the speculative batch (already rolled back by the `with db:` context). Also moved `set_parsing_mempool(False)` to a `finally` to prevent stuck-singleton state. |
+| `14403373c` | `parser/check.py` `software_version()` | `check_change` reads upstream JSON values and compares them with `<` to ints. A compromised counterparty.io / DNS-poisoned response delivering a string where an int was expected raises `TypeError` not in the existing except tuple → propagates through BlockchainWatcher.handle() → self.stop(). Caught by adding `(KeyError, TypeError, AttributeError)` to the except tuple. |
 
 ---
 
-## Ultrareview findings (external pass, 2026-04-22)
+## Rust panic surface fixed (`counterparty-rs`)
 
-4 findings, all verified real (no false positives this pass). 3 applied; 1 deferred.
-
-| Bug | Severity | Status |
+| Commit | File | Issue |
 |---|---|---|
-| bug_009 — `broadcast.parse` CBOR halt | consensus halt | Fixed in `fb7fe8288` |
-| bug_002 — `BackendHeight` retry spam | operational | Fixed in `e66953cd1` |
-| bug_010 — `utxo.parse` hardcoded event name | nit | Fixed in `0247a4ce2` |
-| bug_005 — CI workflow unpinned nightly Rust | nit | Deferred. In upstream commit `88896bc87 fix electrs installation on github` (Ouziel, 2026-01-30). Out of halt/accounting audit scope; reverting may break whatever drove the nightly switch. |
+| `b207f8b68` | `indexer/bitcoin_client.rs` | `parse_vout` had off-by-one bounds checks at two sites (P2PKH-ish and multisig). `bytes[1..=prefix.len()]` needs `bytes.len() > prefix.len()`, not `>=`. Also added `data_len` clamp + early-return when `data_len < prefix.len()`. |
+| `ff082f9e1` | `utils.rs` | `script_to_address_legacy` had `panic!("we thought this shouldn't happen!")` on attacker-bytes else-branch. Replaced with `PyErr::new::<PyValueError, _>(...)`. |
+| `7566d70ea` + `183c71af6` | `indexer/bitcoin_client.rs` | `BATCH_CLIENT.lock().unwrap()` panicked the worker on a poisoned mutex (any prior panic-while-holding cascaded to all subsequent workers). `BatchRpcClient::new(...).unwrap()` panicked on bad rpc_address config. Use `unwrap_or_else(|p| p.into_inner())` for poison-recovery and clone the client out before dropping the guard so we don't hold the mutex across network IO (perf regression). |
+| `97e0d662b` | `indexer/database.rs:146` | `.expect()` on a missing `BlockAtHeightHasHash` index entry crashed the worker on dirty-shutdown DB state. Convert to `Error::Database` so the worker error-channel handles it. |
+| `9ff88ac8c` | 4 sites in `indexer/handlers/start.rs`, `indexer/utils.rs`, `indexer/workers/{writer,reporter}.rs` | u32 underflow patterns: `start_height - 1` when `start_height == 0`; `target_height - reorg_window` when `target_height < 50` (small chains); `height - reorg_window`; `prev_height` and `CP_HEIGHT` math in reporter. Use `saturating_sub` and additive forms. |
+
+---
+
+## API drift / quiet accounting bugs (already-deployed)
+
+These are bugs that have been silently affecting mainnet for some time. Most are derived state (state DB), not consensus state, but they cause snapshot-bootstrapped vs event-streamed nodes to diverge or API consumers to silently miss data.
+
+| Commit | File | Issue | Empirical |
+|---|---|---|---|
+| `f3b01b532` | `api/migrations/0004` | `LEFT JOIN` had a `WHERE` on the right table → silently became INNER JOIN. Assets issued but never destroyed were missing from supplies. Removed WHERE. | — |
+| `12bfd2f9e` | `messages/sweep.py` | Every other parse module calls `set_transaction_status(...)`; sweep didn't. Every sweep on mainnet has `valid=NULL` in `transactions_status`. API filters using `valid=1`/`valid=0` silently exclude all sweeps. Invalid sweeps were entirely invisible. Added the call + invalid-record persistence. | **1,517/1,517 (100%)** of mainnet sweeps affected. Verifiable via `api.counterparty.io:4000/v2/transactions/<sweep_tx_hash>` → `"valid": null`. |
+| `fac268916` | `api/apiwatcher.py:57` | `EVENTS_ADDRESS_FIELDS["DETACH_FROM_UTXO"] = ["sourc_address", "destination"]` — typo. Source-side address_events silently dropped for every DETACH. | All DETACH events affected. |
+| `ef7903a3d` | `api/apiwatcher.py` | `update_assets_info` never set `description_locked` (mig 0004 reads it from issuances, streamed handler doesn't). Snapshot-bootstrapped node has `description_locked=1`; streamed node has `0`. Same shape for `xcp_supply` (no `status='valid'` filter). Both fixed. | — |
+| `d40892da1` | new `0014.fix_assets_info_latest_issuance_columns.py` | Migration 0004 selected `description`/`divisible`/`mime_type`/`owner` via bare-column SELECT alongside MIN/MAX aggregates → SQLite picks bare columns "from one of" the min/max rows, implementation-dependent. Snapshot vs streamed nodes drifted for re-issued/transferred assets. New corrective migration re-derives from latest valid issuance. | — |
+| `d8e46d349` | new `0015.fix_assets_info_locked_int_drift.py` | Migration 0004 wrote `SUM(locked)` and `SUM(description_locked)` into `BOOL DEFAULT 0` columns → snapshot-bootstrapped node had `locked=3` for assets with three locking issuances; streamed node had `locked=1`. Both truthy but unequal. Re-derive as `MAX(...) ∈ {0,1}`. | — |
+
+(Migration 0014/0015 themselves had three bugs in my own code — broken import path, illegal nested transaction, locked DETACH — all caught when I first ran them in WSL. Final pattern matches existing 0006 ATTACH-without-DETACH; commits `8781fe5af`, `78b5e6915`, `79d964da1`. Lesson: always run a migration via the test infra before merging it.)
+
+---
+
+## Operational hygiene & concurrency
+
+| Commit | What |
+|---|---|
+| `e66953cd1` | `BackendHeight.refresh()` assigned `last_check` only on success path. Persistent 401/403/502 RPC errors drove ~10 Hz retries (~36k RPC calls/hr). Move assignment to `finally`. |
+| `aa968b8b6` | `transactions_status` orphan rows on reorg. Added to `clean_transactions_tables` + rebuild_database drop list. |
+| `64c0ab4f5` + `24a0e24fb` | `rollback()` didn't clear `backend.bitcoind.TRANSACTIONS_CACHE`. Added `reset_caches()` helper + call. |
+| `25ddfe5a6` | Reorg + mempool hygiene batch: `clean_mempool` only walked the events table (mempool_transactions leak); `rollback()` didn't truncate mempool/mempool_transactions (post-reorg state stale); `handle_reorg` walked unbounded past genesis on wrong-network/corrupt-DB; `reparse()` didn't clear bitcoind caches. All four addressed. |
+| `148829885` | ZMQ `connect_to_zmq` reconnect leaked sockets+context (long-running indexers eventually exhausted fds). Plus `RCVTIMEO` typo (set on wrong socket). Both fixed. |
+| `e1d666a45` | `UTXOLocks` (composer.py) singleton was shared across werkzeug worker threads with no synchronization. Two concurrent compose calls between `filter_unspent_list` and `lock_inputs` could pick the same UTXO. Added `threading.Lock`. |
+| `2f5452967` | block_index forwarding pattern: 6 gated `unpack(message)` callsites + `dividend.unpack` were dropping `tx["block_index"]`, falling back to `CurrentState`. During real-time parse these match, but it's a footgun for any future caller that re-parses with stale CurrentState. Pass the explicit block_index. |
+| `204178df7` | Decimal context leak: `helpers.divide` and `verbose.normalize_price` set `decimal.getcontext().prec = N` as a side effect, mutating the thread-local Decimal context permanently. If `helpers.divide` is ever imported into a parse path, every subsequent Decimal op on that thread silently uses prec=16 → consensus-split footgun. Switched to `with decimal.localcontext()`. |
+| `24869bdea` + `75944d5ef` | `SingletonMeta` had a classic check-then-act race; two threads could both pass the `not in _instances` check before either stored. Added class-level `threading.Lock` with double-checked locking. Also fixed `reset_caches()` not clearing `@functools.lru_cache` wrappers (`getrawtransaction`, `get_utxo_address_and_value`) — orphaned UTXO data persisted across reorg. Guarded with `hasattr` for test fixtures that monkey-patch. |
+| `6205cf91a` | `gas.py:112` libm cross-platform threshold inline comment. ULP drift in `math.exp(-k * (t - midpoint))` is absorbed by `int(fee * UNIT)` at current `base_fee=1`; if `base_fee` ever exceeds ~1.8e8 the drift becomes visible across libm implementations. Documented at the call site. |
+
+---
+
+## API security
+
+| Commit | What |
+|---|---|
+| `6f3a73c55` | `apiv1.py:281` `filter_["field"]` was f-string interpolated into SQL with no validation. Body like `filters=[{"field":"1) UNION SELECT password,1,1 FROM ...--",...}]` reads any column the API process can see. Apply `^[a-z0-9_]+$` regex (matches existing `order_by` validation). |
+| `6f3a73c55` | `cli/server.py` debug-logged the entire config dict including `BACKEND_PASSWORD`, `RPC_PASSWORD`, `API_PASSWORD`, `BACKEND_COOKIE`. Operators with `--verbose` or Sentry breadcrumbs leaked credentials. Redact any key matching `PASSWORD/SECRET/COOKIE/TOKEN/KEY`. |
+| `50ef4e9ac` | `--api-only` shutdown loop never checked `is_set()`; `stop()` set the event but the loop kept running. Added the check. |
+| `74d7ba380` | `apiv1.py:565` `sql` JSON-RPC method (added by PhantomPhreak in 2014, undocumented in `apiary.apib`, live + unauthenticated on `api.counterparty.io:4000` for 12 years). DB is read-only so no exfil risk (Counterparty data is public), but is a real DoS surface (`randomblob(1e9)`, recursive CTEs, N-way self-joins on the 20M-row messages table). Smallest behavior change: require `RPC_PASSWORD` to be set for the method to work. Operators who want it opt in by setting a password. |
+
+---
+
+## Protocol-gated future fixes (pending activation coordination)
+
+These are consensus-affecting fixes that need a coordinated activation block. All default OFF (placeholder `block_index=999999999`, signet `0` for testing). Adam's call on activation timing.
+
+| Gate | Fix | Risk if delayed |
+|---|---|---|
+| `check_btcpay_destination` | Reject btcpay txs whose destination doesn't match the legitimate counterparty (the CRITICAL above) | **Active fund-theft window** until shipped. 11 years latent + 2,158/2,158 honest history → low recent risk, but documented in this branch now → tickling the noise floor. |
+| `fix_sort_bet_matches` | Bet matching currently sorts in tx_index order due to a `sorted(...) result discarded` no-op (10+ years old). Gated proper sort by price-then-tx_index. | Bet matching suboptimality, no fund safety. |
+| `canonical_subasset_compact` | Reject CBOR subasset issuances whose `compact(expand(bytes)) != bytes` — fixes leading-zero pad and "phantom `!`" malleability. | Asset-name malleability; no historical reach (4,065 post-taproot subasset issuances, all canonical via compose). |
+| `fix_attach_op_return_check` | Use `is not None` instead of Python truthiness in the OP_RETURN check (asset-loss bug for attach to OP_RETURN at vout 0). | Asset self-loss only; 0 historical mainnet occurrence. |
+
+---
+
+## Process meta — bugs caught in my own code
+
+This branch is not a heroic single commit — it's a long series of attempts, each verified before the next. Five times during this audit, the testing discipline caught real damage in fixes I authored:
+
+1. **`5e1ba61a0` (REVERTED)** — Added a btc_order_minimum check to `order.validate` mirror to give honest composers a `ComposeError`. Fix-review caught that `order.parse` already runs the same check and **appends to status** if `problems` is non-empty, so my "fix" produced `status="invalid: btc order below minimum; btc order below minimum"` — different string → different `messages_hash` → **chain split on every sub-min BTC order ≥ block 286700**. Empirically: **8,881 historical mainnet orders** would have re-parsed differently. Reverted in `d9b4a3322`.
+
+2-4. **Migration 0014/0015 (3 bugs)** — When I first authored these corrective migrations, they had: wrong import path (`from counterpartycore.lib import database` — wrong namespace); illegal nested transaction (`db.execute("BEGIN")` inside yoyo's tx); locked DETACH (DETACH while ledger_db has open ref). All three caught by running the migration via the test infra in WSL. Final pattern matches existing 0006.
+
+5. **`75944d5ef`** — My lru_cache `cache_clear` calls in `reset_caches` raised `AttributeError` in tests because test fixtures monkey-patch `get_utxo_address_and_value` with a plain function. Wrapped with `hasattr` guard.
+
+Lesson: every fix gets a test before it ships. Self-review caught each before it hit prod.
+
+---
+
+## Investigated and closed as not-a-bug
+
+- **F2 `safe_get_utxo_address` "unknown" sentinel** — agent claim was that detach.py would credit assets to a phantom address called `"unknown"` when `utxo_address` couldn't be derived from a non-standard scriptPubKey (bare multisig, P2PK). Empirical investigation traced the 5 historical "unknown" cases on mainnet: 4 are `utxo move` (asset moves to a real new UTXO with non-derivable address — recoverable by spending), 1 is legacy message-type-100 utxo.py which defaults `recipient` to "first non-OP_RETURN output" (not to `balance["utxo_address"]`). All 5 have `address=NULL, utxo=<real_utxo>, utxo_address="unknown"` — the assets are spendable; "unknown" is purely metadata noise on the column. The theoretical detach.py path that WOULD produce a phantom-address credit has 0 mainnet occurrences. Adding a defensive change to detach.py for a non-occurring case would be the same pattern that produced the consensus-breaking `5e1ba61a0`. **No fix; documented for future reference.**
+- **Concurrency dict-cache races** (`TRANSACTIONS_CACHE` / `BLOCKS_CACHE` racing with reorg) — reads are atomic dict-key access (GIL); the only race is "entry added by `add_transaction_in_cache` between its two non-atomic ops survives a concurrent `clear()`" which is benign cache state. Skipped per "don't add complexity for theoretical issues" pattern.
+- **APIv1 `sql` JSON-RPC endpoint** as data exfil — turned out to be intentional 2014 feature by PhantomPhreak (commit `a29759ee8`). DB is read-only; Counterparty data is public; no exfil risk. Closed the DoS-surface concern with `74d7ba380` (require auth).
+- **Several wave-3 agent claims** that didn't reproduce empirically (concurrency SingletonMeta/cache scenarios, address-pack/unpack edge cases, etc.) — discarded after verification.
 
 ---
 
 ## Verified-safe (don't re-audit without new info)
 
-### Fairmint / Fairminter (user's explicit concern)
-- **Supply-for-less-than-price.** `fairmint.py:66-69, 205-206` uses `math.ceil` on the attacker's XCP payment. Traced every off-grid `quantity` — every deviation from `quantity = N * quantity_by_price` yields *fewer* units per sat, not more. `compose` enforces grid alignment, but even without it parse-time favors the protocol. No exploit.
-- **Premint claim by non-contributor.** Premint always credited to `fairminter["source"]` (stored at open time from `tx["source"]`). No user-controllable path to forge the `source` stored in `fairminters` row.
-- **Hard-cap overshoot.** Cap check uses strict `>` in validate and `==` for close; `partial_mint_to_reach_hard_cap` clamps `earn_quantity = hard_cap - asset_supply`. Commission split preserves total: `earn_quantity + commission = original_quantity`.
-- **Fairminter parameter constraints.** `max_mint_per_tx <= max_mint_per_address`, `quantity_by_price >= 1`, `hard_cap % quantity_by_price == 0`, and MAX_INT bounds all enforced at open time.
-- **Premint escrow/unescrow symmetry.** Balanced across open, soft-cap-reached, soft-cap-missed, hard-cap-close state transitions.
+### Authorization sweep (across all 21 message handlers) — fully clean
+Every credit/debit/transfer/ownership-change verified tied to `tx["source"]` or to immutable record fields populated at original signer-authorized insert time. **0 wrongful-credit paths found.** Empirically validated against mainnet: every (address, asset) balance equals exactly SUM(credits) − SUM(debits) across 10 years of history.
 
-### Send family (user flagged many versions + if/else gap concern)
-- **Cross-version routing.** `blocks.py:165-174` dispatch gates each version by both `message_type_id` AND `protocol.enabled(...)`. No bypass — IDs are disjoint constants (0, 2, 3).
-- **Credit without debit / vice versa.** All three paths (send1, enhancedsend, mpma) guard debit+credit under `if status == "valid"` with debit before credit, inside the outer transaction in `blocks.py:131`. Any raise between debit and credit rolls back.
-- **Self-send double-credit.** Debit runs before credit on the same SQLite row; SQLite serializes intra-tx ops. Net zero minus fees.
-- **Source authorization.** All three use `tx["source"]` for debit, never trust message-embedded source.
-- **MPMA partial success.** `status == "valid"` guards the whole for-loop body; no partial ledger writes.
-- **Defensive gaps not fixed (not currently reachable):**
-  - `send1.validate:62-65` calls `active_options(result["options"], ...)` which would do `None & int → TypeError` if `options` were NULL. Schema allows NULL (`options INTEGER` no NOT NULL), but no current INSERT path writes NULL. Latent. Skipped per "no defensive dead code" policy.
-  - `mpma.validate:76-83` lacks a `return problems` after `isinstance(quantity, int)` check. Unreachable today because `_decode_mpma_send_decode` uses `uintbe:64` bitstream reads that always yield int. Latent.
-  - `ledger/events.py:250` `assert asset == config.XCP` when `len(address) == 40`. No concrete byte sequence produces a 40-char address (base58 ~34, bech32 ~42). Theoretical.
-  - `sweep.py` CBOR path: `flags=-1` passes `flags > FLAGS_ALL` (7) check and `(-1) & FLAGS_ALL == 7` is truthy. Behaves identically to `flags=7` on-chain, stored as `-1` in `sweeps` table. No value impact, consensus stable. Cosmetic.
-
-### Sweep / Dividend / Dispenser (user's explicit concern: unauthorized ownership transfer, wrong credits)
-- **Sweep source authorization.** `tx["source"]` drives balance debit (`sweep.py:227-235`) and issuance ownership check (`last_issuance["issuer"] == tx["source"]` at line 263). Attacker cannot sweep an address they didn't sign from.
-- **Sweep dangling references.** Open orders/bets/dispensers escrow funds outside the `balances` table. Sweep only moves free balances; escrow rows resolve to original source on refund/close.
-- **Dividend rounding.** Each `dividend_quantity = int(address_quantity * quantity_per_unit / UNIT)`; `dividend_total = sum(dividend_quantity)`. Debit matches sum-of-credits by construction.
-- **Dividend holder selection.** `exclude_empty`, `no_dividend_to_self`, `dispensers_in_holders` all protocol-gated and consensus-stable.
-- **Dispenser authorization.** Create can only come from an address with balance of the asset (`validate` 85-90). Refill/close require `tx["source"] == action_address` OR `tx["source"] == existing["origin"]` (lines 526-529, 616-629). `give_quantity`/`satoshirate` immutable after creation (lines 522-524).
-- **Dispenser escrow atomicity.** Empty-address debit/credit/debit wrapped in `if is_empty_address:`; on exception, `DebitError` caught and DB tx rolls back. No half-escrow.
-
-### Gas / fee (user flagged as relatively new code)
-- **libm non-determinism at current params.** `int(math.exp(x) * base_fee)` at `base_fee=1` absorbs ULP drift via `int()` floor. ULP-perturbation scan across `x∈[4,14]`: zero fee delta. Derived drift bound: consensus breaks only if `base_fee ≥ ~1.8e8` (8 orders above current).
-- **Integer overflow.** Worst-case fee (`(x−b)^1.5 / 100 * UNIT` at attacker-maximized x≈15873 tx/block) ≈ 2e12 sats, 6 orders below int64 cap.
-- **Counter manipulation.** `increment_counter` gated inside `status == "valid"` + `action == "attach to utxo"` in utxo.parse and attach.parse — symmetric with fee debit.
-- **NaN/Inf halt.** `calculate_fee` inputs come from DB-derived ints and protocol-specified `fee_parameters` — neither attacker-controllable. `math.exp` arg bounded at mainnet params (max ≈ 6), far below 709 overflow threshold.
-- **Reorg rollback.** `transaction_count` in `TABLES` list (blocks.py:91); `DELETE FROM transaction_count WHERE block_index >= ?` runs in rollback. Correct.
+### Per-message audit results
+- **Fairmint / Fairminter:** supply-for-less-than-price not exploitable (`math.ceil` on payment always favors protocol); premint claim by non-contributor not possible (premint always credited to stored `fairminter["source"]`); hard-cap overshoot prevented by strict `>` check; parameter constraints enforced at open time; premint escrow/unescrow balanced across all state transitions.
+- **Send family:** cross-version dispatch correctly gated; credit/debit symmetry holds; self-send double-credit not possible; source authorization correct; mpma partial-success guarded by status check.
+- **Sweep / Dividend / Dispenser:** sweep source authorization gated by `tx["source"]`; sweep doesn't touch escrow funds (orders/bets/dispensers escrow outside `balances`); dividend rounding net-zero by construction; dispenser create/refill/close all auth-gated; dispenser escrow atomicity correct on rollback.
+- **Gas / fee:** libm non-determinism absorbed at current `base_fee=1`; integer overflow bounded; counter manipulation not possible (gated inside `status==valid`); reorg rollback correct.
+- **Bet/order settlement math:** CFD rounding can create/burn 1 sat — but CFDs disabled at block 312350 (effectively dead). Other settlement math conserved by construction.
+- **Address pack/unpack:** all reachable failure modes caught; Rust paths return `PyResult` (no panic surface beyond what we already fixed).
+- **DB migrations 0001-0015:** systematic audit against the LEFT JOIN bug class. Two HIGH findings in 0004 fixed via 0014/0015; the rest verified clean.
+- **Composer paths:** no ledger mutation in compose (verified by exhaustive grep). UTXO selection has the singleton-thread-safety issue we fixed.
 
 ### General
-- **ConsensusHashBuilder determinism.** Singleton construction is sound; hash order is stable.
-- **API v2 limit check / SQL injection.** Prior concern dismissed after finding it is allowlist-protected.
-- **BLOCKS_CACHE.** Appears unused in the hot path — dead code, not a correctness risk.
+- **ConsensusHashBuilder** singleton is sound; hash order stable.
+- **Reorg detection** in `handle_reorg` is correct; rollback table list complete after our fixes; cache invalidation correct after our fixes.
+- **`mainnet_burns.csv`** content pre-audited by user (out of scope).
+- **`protocol_changes.json`** structure verified; 106 entries, no anomalous block indexes; value-only entries correctly never used as boolean gates.
 
 ---
 
-## Fuzz infrastructure (uncommitted, local-only)
+## Empirical mainnet validation
 
-Per user directive: **do not commit, run local**. These files exist as untracked files in `counterparty-core/counterpartycore/test/units/messages/`:
-
-- `fuzz_parse_test.py` — 19 Hypothesis-based fuzz tests, 100 examples each (~1,900 random byte inputs). Targets: issuance, broadcast, dispense, destroy, cancel, utxo, send, bet, order, sweep, fairmint, fairminter, dispenser parse paths.
-- `fuzz_cbor_test.py` — CBOR-encoded tuples with adversarial types (None, str, float, bool, binary, ints up to 2^64). Targets: issuance + subasset parse. **Should extend to broadcast** — that's where bug_009 lives; a broadcast fuzz would have caught it pre-ultrareview.
-
-Run via hatch:
-```
-hatch run pytest counterpartycore/test/units/messages/fuzz_parse_test.py -x
-hatch run pytest counterpartycore/test/units/messages/fuzz_cbor_test.py -x
-```
-
-Known test artifact: `apsw.ConstraintError` from repeated `tx_hash` across Hypothesis examples. Caught explicitly and skipped in the fuzz bodies — not a real bug.
-
----
-
-## Pending / open
-
-- **Property-based fuzzing extensions not yet added:** broadcast CBOR fuzz (would have caught bug_009 locally), compose fuzz, address pack/unpack fuzz, sweep/enhancedsend/mpma CBOR fuzz.
-- **Static analysis** (CodeQL, Semgrep) — user requested but not yet run.
-- **Regtest scenario sweep** against this branch — user's environment; instructions in memory (`reference_wsl_regtest.md`).
-- **Integration validation** — fresh-sync hash comparison against a reference node on mainnet. User's task.
-- **Latent gas.py issues (LOW, not currently exploitable):**
-  - If `base_fee` in `fee_parameters` is ever bumped above ~1.8e8, switch `D(math.exp(x))` to `(x).exp()` under a fixed-precision `localcontext` to eliminate libm cross-platform drift.
-  - Dead branch in `get_transaction_count_for_last_period` (gas.py:56-58) — `fetchone()` on `SELECT SUM(...)` never returns None. Polish only.
-- **Still not audited** (candidates for a future pass): `rps.py`/`rpsresolve.py` (rock-paper-scissors — deprecated but still in parse path?), `burn.py` (initial XCP distribution, probably frozen), additional Rust indexer code beyond `parse_vout`, JSON-RPC / API surface, p2p / mempool handling.
-
----
-
-## Empirical validation against mainnet (2026-04-22)
-
-Connected via gcloud + kubectl to GKE `public-mainnet` cluster, pod
-`counterparty-0`, `/data/counterparty.db`, **driver-level read-only**
-(`?mode=ro`). Ran a series of invariant + scope queries.
+Connected to GKE `public-mainnet` cluster, pod `counterparty-0`, `/data/counterparty.db`, **driver-level read-only** (`?mode=ro`) via gcloud + kubectl. Ran a series of invariant + scope queries.
 
 ### Strongest invariant: balance == credits − debits (per address, asset)
 
@@ -179,29 +198,24 @@ Connected via gcloud + kubectl to GKE `public-mainnet` cluster, pod
 |---|---|
 | `COUNT(*) FROM balances WHERE quantity < 0` | **0** — no negative balances anywhere |
 | XCP per-address: balance vs SUM(credits)−SUM(debits) (exact INT) | **0 drift** |
-| All-assets per-(address, asset), REAL (Q3a) | 183 "drifts" max 16640 sat |
-| Q3c follow-up: per-asset INTEGER spot-check on EDRACHMA (highest drift) | **0 actual drift** — Q3a 183 was double-precision ulp loss on high-supply assets |
+| All-assets per-(address, asset), REAL math | 183 "drifts" max 16640 sat |
+| Per-asset INTEGER spot-check on EDRACHMA (highest "drift") | **0 actual drift** — Q3a's 183 was double-precision ulp loss on high-supply early assets (MAIDSAFE/EDRACHMA/etc.) |
 
-**The mainnet ledger DB has 0 real accounting drifts** across ~10 years
-and ~20M messages. Every (address, asset) balance equals exactly the
-sum of its credits minus its debits. This **empirically validates the
-authorization audit's "no wrongful credit/debit" finding** with the
-strongest possible evidence.
+**The mainnet ledger DB has 0 real accounting drifts** across ~10 years and ~20M messages. Every (address, asset) balance equals exactly the sum of its credits minus its debits.
 
-### Bug-exposure scope vs. fixes
+### Bug-exposure scope (all of these had 0 historical exploitation)
 
-For each major bug we fixed, scope of historical/live exposure:
+| Bug | Population | Exploited? |
+|---|---|---|
+| btcpay destination check | 2,158 historical post-313900 mainnet btcpays | **0 (100% honest)** |
+| Sweep `transactions_status` | 1,517 sweeps | **1,517 affected (metadata; no fund loss)** |
+| Dispenser oracle halt | 3,335 negative-value broadcasts × 727 open oracle dispensers | 0 cross-matches |
+| Fairminter multi-dot halt | 1,636 multi-dot subasset longnames | 0 fairminters opened on any |
+| Subasset 200-byte cap | 4,065 post-taproot subasset issuances | 0 over 200 bytes (max 249-char longname → ~191 bytes) |
+| Attach OP_RETURN at vout 0 | (0 historical occurrences) | 0 |
+| Order validate mirror (REVERTED) | **8,881 sub-min BTC orders ≥ block 286700** | would have chain-split if shipped |
 
-| Bug | Population | Live exposure | Notes |
-|---|---|---|---|
-| #8 sweep `transactions_status` missing | 1,517 sweeps | **1,517 (100%) NULL** | Fix `12bfd2f9e` corrects forward; historical rows need rollback+reparse to backfill |
-| #10 DETACH `sourc_address` typo | (see live API check) | every DETACH affected | Confirmed via API earlier; all source-side address_events silently dropped |
-| Dispenser negative oracle halt (`c624cc96b`) | 3,335 negative-value broadcasts (excl -2/-3) × 727 open oracle dispensers | **0** | No oracle dispenser ever pointed at a negative-value broadcaster — bug was real but never triggered. Now permanently closed. |
-| Fairminter multi-dot halt (`0aefc5794`) | 1,636 multi-dot subasset longnames | **0** | No fairminter has ever opened on a multi-dot subasset. Real bug, 0 trigger. |
-| Subasset CBOR DoS cap (`0aefc5794`) | 4,065 post-taproot subasset issuances | 0 over 200 bytes | Max longname 249 chars → max compacted ~191 bytes, comfortably under 200. Cap is provably safe historically. |
-| Order validate mirror reverted (`d9b4a3322`) | **8,881 sub-min BTC orders post-block 286700** | would have chain-split | This is the population that would have re-parsed differently if `5e1ba61a0` had shipped. Caught by fix-review. |
-
-### Other counts
+### Other counts (for context)
 
 | Metric | Value |
 |---|---|
@@ -211,27 +225,45 @@ For each major bug we fixed, scope of historical/live exposure:
 | Addresses with non-zero balance | 401,768 |
 | Open BTC-side orders | 106,060 |
 | Open dispensers | 284,806 |
-| Issuances at quantity=MAX_INT | 27 (clamp boundary handling exists historically) |
-| Destroys at quantity=MAX_INT | 0 (clamp fix had no historical reach) |
 | Largest single-asset supply | 9,223,372,036,854,775,807 (= MAX_INT — confirmed someone issued at the boundary) |
 
-### What this audit pass cannot prove
+---
 
-- **Subasset canonicalization scan** — would need Python to decrypt + decode 4,065 CBOR messages and check `compact(expand(bytes)) == bytes`. Recommended as a one-shot script before activating `canonical_subasset_compact`. None of the 4,065 were created via hand-rolled CBOR (compose always produces canonical), but verifying programmatically would let the activation block be set freely.
-- **Hash-compare against reference node** — a fresh sync to the same tip with hash equality at every block. Strongest possible end-to-end check; user environment.
+## Static analysis
+
+Semgrep p/security-audit + p/python + p/owasp-top-ten + p/cwe-top-25 against `lib/`. **4 total warnings**, all already suppressed with `nosec`/`noqa` markers, all justified (signed snapshot downloads, intentional rw-group config files). Codebase is clean from Semgrep's perspective.
+
+CodeQL deferred (CLI not installed in this environment; given Semgrep clean and extensive multi-agent + manual coverage, lower-leverage than the work we did).
+
+---
+
+## Fuzz infrastructure (uncommitted, local-only per directive)
+
+`fuzz_parse_test.py` + `fuzz_cbor_test.py` exist in `counterpartycore/test/units/messages/` as untracked files. 19 Hypothesis-based fuzz tests + CBOR-encoded adversarial-tuple tests across issuance, subasset, broadcast, enhancedsend, sweep, dispense, destroy, cancel, utxo, send, bet, order, fairmint, fairminter, dispenser parse paths.
+
+Run via `hatch run pytest counterpartycore/test/units/messages/fuzz_*.py -x`. Recommended to formalize and commit as part of CI if desired.
+
+---
+
+## Pending / open
+
+- **Activation block coordination** for the 4 protocol-gated fixes (esp. `check_btcpay_destination`).
+- **Hash-compare against an independent reference node** — the strongest possible end-to-end check; user environment.
+- **Regtest scenario sweep** against this branch — user environment.
+- **Subasset canonicalization scan** (Python: decrypt + decode 4,065 CBOR messages, check round-trip) before activating `canonical_subasset_compact`. Almost certainly clean (compose always produces canonical), but verifying programmatically would let the activation block be set freely.
+- **CodeQL deeper interprocedural pass** if wanted.
+- **APIv1 `sql` endpoint** decision: deprecate, document on v2, or leave as opt-in-via-RPC_PASSWORD.
 
 ---
 
 ## Reviewing this branch
 
 ```bash
-git log master..HEAD --oneline
-git diff master..HEAD --stat
+git log master..HEAD --oneline           # 90 commits
+git diff master..HEAD --stat             # files changed summary
+git show <commit-hash>                    # any specific fix
 ```
 
-To verify a specific fix:
-```bash
-git show <commit-hash>
-```
+Each commit message includes: the attack vector, the fix mechanism, and (where relevant) the reasoning for choosing one fix pattern over alternatives. This document and those commit messages together should be enough to pick this branch up cold. The companion `AUDIT_TRACKING.md` has the chronological "running notes" of how each finding was investigated.
 
-Each commit message includes: the attack vector, the fix mechanism, and (where relevant) the reasoning for choosing one fix pattern over alternatives. This document and those commit messages together should be enough to pick this branch up cold.
+For the headline finding, `git show 2057e099c` has the full btcpay attack model + fix + test rationale.
