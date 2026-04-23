@@ -298,20 +298,14 @@ def validate(
     if expiration > config.MAX_EXPIRATION:
         problems.append("expiration overflow")
 
-    # Mirror the parse-side btc_order_minimum check (parse() at order.py:423-436)
-    # so honest composers get a ComposeError before broadcasting an order that
-    # parse will mark invalid -- otherwise the user pays a BTC tx fee for a
-    # transaction the network will silently reject.
-    if protocol.enabled("btc_order_minimum", block_index=block_index):
-        min_btc_quantity = 0.001 * config.UNIT  # 0.001 BTC
-        if protocol.enabled("btc_order_minimum_adjustment_1", block_index=block_index):
-            min_btc_quantity = 0.00001 * config.UNIT  # 0.00001 BTC
-        if protocol.enabled("fix_min_btc_quantity", block_index=block_index):
-            min_btc_quantity = int(D("0.00001") * D(1e8))
-        if (give_asset == config.BTC and give_quantity < min_btc_quantity) or (
-            get_asset == config.BTC and get_quantity < min_btc_quantity
-        ):
-            problems.append("btc order below minimum")
+    # NOTE: tempting to mirror the parse-side btc_order_minimum check here so
+    # composers get a ComposeError early. Don't -- parse() at order.py:438-451
+    # already runs that check independently AND appends to status if `problems`
+    # is non-empty. Adding the same problem here causes the parse to produce
+    # status="invalid: btc order below minimum; btc order below minimum" --
+    # different string -> different messages_hash -> consensus split. To add
+    # the compose-side warning safely, dedup the parse-side append too,
+    # behind a new protocol gate.
 
     cursor.close()
     return problems
