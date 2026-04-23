@@ -31,7 +31,14 @@ def apply(db):
     start_time = time.time()
     logger.debug("Re-deriving assets_info.locked + description_locked as booleans...")
 
-    db.execute("ATTACH DATABASE ? AS ledger_db", (config.DATABASE,))
+    # 0014 attaches ledger_db (and doesn't DETACH per the 0006 pattern);
+    # attach defensively if not present (e.g. 0015 re-applied alone).
+    attached = db.execute(
+        "SELECT COUNT(*) AS count FROM pragma_database_list WHERE name = ?", ("ledger_db",)
+    ).fetchone()
+    attached_count = attached[0] if attached else 0
+    if not attached_count:
+        db.execute("ATTACH DATABASE ? AS ledger_db", (config.DATABASE,))
 
     db.execute(
         """
@@ -49,8 +56,6 @@ def apply(db):
         WHERE asset NOT IN ('XCP', 'BTC')
         """
     )
-
-    db.execute("DETACH DATABASE ledger_db")
 
     logger.debug(
         "Re-derived assets_info.locked + description_locked in %.2f seconds",

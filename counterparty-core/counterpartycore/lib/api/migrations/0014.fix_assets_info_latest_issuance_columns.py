@@ -31,9 +31,17 @@ def apply(db):
     logger.debug("Re-deriving assets_info latest-issuance columns...")
 
     # ATTACH the ledger DB so we can JOIN against issuances directly --
-    # mirrors the pattern in 0006 (which ATTACHes ledger_db and does the
-    # whole derivation as a single UPDATE-FROM via correlated subqueries).
-    db.execute("ATTACH DATABASE ? AS ledger_db", (config.DATABASE,))
+    # mirrors the pattern in 0006. Check first since prior migrations may
+    # have already attached it (and DETACH while a write tx is open fails
+    # with "database ledger_db is locked").
+    attached = (
+        db.execute(
+            "SELECT COUNT(*) AS count FROM pragma_database_list WHERE name = ?", ("ledger_db",)
+        ).fetchone()
+    )
+    attached_count = attached[0] if attached else 0
+    if not attached_count:
+        db.execute("ATTACH DATABASE ? AS ledger_db", (config.DATABASE,))
 
     db.execute(
         """
@@ -62,7 +70,10 @@ def apply(db):
         """
     )
 
-    db.execute("DETACH DATABASE ledger_db")
+    # No DETACH: yoyo's transaction holds locks; explicit DETACH while
+    # the write tx is open raises "database ledger_db is locked".
+    # Following the 0006 pattern, leave ledger_db attached for subsequent
+    # migrations.
 
     logger.debug("Re-derived assets_info rows in %.2f seconds", time.time() - start_time)
 
