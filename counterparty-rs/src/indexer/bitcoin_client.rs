@@ -751,28 +751,36 @@ pub fn parse_transaction(
     if !data.is_empty() || 
         parsed_vouts.as_ref().map_or(false, |p| p.destinations == vec![config.unspendable()]) {
 
-        // Recover from a poisoned mutex (PoisonError carries the inner data).
-        // Without this, any panic-while-holding by a prior worker would crash
-        // every subsequent worker on .unwrap(). HttpClient::builder().build()
-        // can also fail on a malformed rpc_address; log and skip the prev_tx
-        // lookup rather than crashing the worker on a config-validation issue.
-        let mut guard = BATCH_CLIENT
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if guard.is_none() {
-            match BatchRpcClient::new(
-                config.rpc_address.clone(),
-                config.rpc_user.clone(),
-                config.rpc_password.clone(),
-            ) {
-                Ok(client) => *guard = Some(client),
-                Err(e) => {
-                    tracing::warn!("BatchRpcClient init failed; skipping prev_tx lookup: {:?}", e);
+        // Clone the BatchRpcClient out of the singleton (it's Clone with
+        // Arc-backed fields -- cheap) so we can release the mutex before
+        // doing any network RPC. Holding the lock across get_transactions
+        // would serialise every worker through a single mutex and erase
+        // the parallelism. Recover from poisoning with into_inner.
+        // BatchRpcClient::new can fail on malformed rpc_address; log and
+        // skip the prev_tx lookup rather than crashing the worker.
+        let batch_client = {
+            let mut guard = BATCH_CLIENT
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if guard.is_none() {
+                match BatchRpcClient::new(
+                    config.rpc_address.clone(),
+                    config.rpc_user.clone(),
+                    config.rpc_password.clone(),
+                ) {
+                    Ok(client) => *guard = Some(client),
+                    Err(e) => {
+                        tracing::warn!(
+                            "BatchRpcClient init failed; skipping prev_tx lookup: {:?}",
+                            e
+                        );
+                    }
                 }
             }
-        }
+            guard.as_ref().cloned()
+        };
 
-        if let Some(batch_client) = guard.as_ref() {
+        if let Some(batch_client) = batch_client {
 
             let input_txids: Vec<_> = tx
                 .input
